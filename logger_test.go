@@ -7,6 +7,12 @@ import (
 	"testing"
 )
 
+// Example:
+// source: 'ERROR: 2016-11-21T14:50:23+03:00 khramtsov logger.go:124, logger_test.go:102: message text'
+// regexp: ': 2016-11-21T14:50:23+03:00 khramtsov logger.go:124, logger_test.go:102:'
+var expr = regexp.MustCompile(`: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2} [^ ]+ ([^:]+:\d+)*:`)
+var exprTimeUser = regexp.MustCompile(`: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2} [^ ]+`)
+
 func TestAddProvider(t *testing.T) {
 
 	providerInfo := Provider{Level: LEVEL_INFO}
@@ -44,67 +50,94 @@ func TestMessage(t *testing.T) {
 	// example:
 	// Err: 2016-09-29T14:32:49+03:00 MyHost testing.go:610: text1 text2 text3text4
 	// Info: 2016-09-29T14:32:49+03:00 MyHost testing.go:610: text1 text2 text3text4
-	expr := regexp.MustCompile(`: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2} [^ ]+ [^:]+:\d+:`)
 
 	testData := []interface{}{"line1\nline2", "line3\r\nline4", "text1", "text2", 10}
 
 	for _, prefix := range []string{"Err", "Info"} {
-		msg := string(makeMessage(prefix, testData))
-		msg = expr.ReplaceAllString(msg, "")
+		msg := string(makeMessage(prefix, testData, TRACE_TYPE_ANY))
+		result := expr.ReplaceAllString(msg, "")
 
 		etalon := prefix + " line1\tline2 line3\tline4 text1 text2 10"
-		if msg != etalon {
-			t.Errorf("Failed massage: '%s' != '%s'", msg, etalon)
+		if result != etalon {
+			t.Errorf("Failed massage: \n'%s' !=\n'%s'\n(source: %s)", result, etalon, msg)
 		}
 	}
 }
 
 func TestFormat(t *testing.T) {
 
-	provider := Provider{Level: LEVEL_DEBUG}
+	provider := Provider{Level: LEVEL_DEBUG, NotCheckLevel: true}
 	l := NewLogger()
-	l.SetLevel(LEVEL_DEBUG)
+	l.SetLevel(provider.Level)
 	l.RegisterProvider(&provider)
-
 	l.AddLogProvider(provider.GetID())
 	l.AddErrorProvider(provider.GetID())
 	l.AddFatalProvider(provider.GetID())
 	l.AddDebugProvider(provider.GetID())
 
-	fn := func(messageType string) {
-		if str := recover(); str != nil {
-			// example:
-			// Err: 2016-09-29T14:32:49+03:00 MyHost testing.go:610: text1 text2 text3text4
-			// Info: 2016-09-29T14:32:49+03:00 MyHost testing.go:610: text1 text2 text3text4
-			expr := regexp.MustCompile(`: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2} [^ ]+ [^:]+:\d+:`)
-			msg := expr.ReplaceAllString(fmt.Sprintf("%v", str), "")
-			msg = strings.Replace(msg, fmt.Sprintf("call %s: ", messageType), "", -1)
+	for _, traceType := range []int{TRACE_TYPE_ONE, TRACE_TYPE_ANY} {
+		l.SetTraceType(traceType)
 
-			// example:
-			// ERROR format: text 10
-			// INFO format: text 10
-			etalon := fmt.Sprintf("%s format: text 10", strings.ToUpper(messageType))
-			if msg != etalon {
-				t.Errorf("Failed format: '%v' != '%v' ", msg, etalon)
+		fn := func(messageType string) {
+			if str := recover(); str != nil {
+				// example:
+				// Err: 2016-09-29T14:32:49+03:00 MyHost testing.go:610: text1 text2 text3text4
+				// Info: 2016-09-29T14:32:49+03:00 MyHost testing.go:610: text1 text2 text3text4
+
+				{
+					msg := expr.ReplaceAllString(fmt.Sprintf("%v", str), "")
+					msg = strings.Replace(msg, fmt.Sprintf("call %s: ", messageType), "", -1)
+
+					// example:
+					// ERROR format: text 10
+					// INFO format: text 10
+					etalon := fmt.Sprintf("%s format: text 10", strings.ToUpper(messageType))
+					if msg != etalon {
+						t.Errorf("Failed format: \n'%v' !=\n'%v'(source: %s)", msg, etalon, str)
+					}
+				}
+
+				{
+					msg := exprTimeUser.ReplaceAllString(fmt.Sprintf("%v", str), "")
+					msg = strings.Replace(msg, fmt.Sprintf("call %s: ", messageType), "", -1)
+
+					switch traceType {
+					case TRACE_TYPE_ONE:
+						etalon := fmt.Sprintf("%s logger_test.go:124: format: text 10", strings.ToUpper(messageType))
+
+						if msg != etalon {
+							t.Errorf("Failed format: \n'%v' !=\n'%v'(source: %s)", msg, etalon, str)
+						}
+					case TRACE_TYPE_ANY:
+						etalon := fmt.Sprintf("%s logger_test.go:124, logger_test.go:138: format: text 10", strings.ToUpper(messageType))
+
+						if msg != etalon {
+							t.Errorf("Failed format: \n'%v' !=\n'%v'(source: %s)", msg, etalon, str)
+						}
+					}
+				}
 			}
 		}
+
+		func() {
+			defer fn("Log")
+			l.Logf("format: %s %d", "text", 10)
+			l.Logf("format: text 10")
+
+			defer fn("Debug")
+			l.Debugf("format: %s %d", "text", 10)
+			l.Debugf("format: text 10")
+
+			defer fn("Error")
+			l.Errorf("format: %s %d", "text", 10)
+			l.Errorf("format: text 10")
+
+			defer fn("Fatal")
+			l.Fatalf("format: %s %d", "text", 10)
+			l.Fatalf("format: text 10")
+		}()
 	}
 
-	defer fn("Log")
-	l.Logf("format: %s %d", "text", 10)
-	l.Logf("format: text 10")
-
-	defer fn("Debug")
-	l.Debugf("format: %s %d", "text", 10)
-	l.Debugf("format: text 10")
-
-	defer fn("Error")
-	l.Errorf("format: %s %d", "text", 10)
-	l.Errorf("format: text 10")
-
-	defer fn("Fatal")
-	l.Fatalf("format: %s %d", "text", 10)
-	l.Fatalf("format: text 10")
 }
 
 func TestPringMessage(t *testing.T) {
@@ -143,7 +176,8 @@ func TestPringMessage(t *testing.T) {
 
 type Provider struct {
 	ProviderInterface
-	Level int
+	Level         int
+	NotCheckLevel bool
 }
 
 func (p Provider) GetID() string {
@@ -151,13 +185,13 @@ func (p Provider) GetID() string {
 }
 
 func (p *Provider) Log(msg []byte) {
-	if p.Level < LEVEL_INFO {
+	if p.Level < LEVEL_INFO || p.NotCheckLevel {
 		panic("call Log: " + string(msg))
 	}
 }
 
 func (p *Provider) Debug(msg []byte) {
-	if p.Level < LEVEL_DEBUG {
+	if p.Level < LEVEL_DEBUG || p.NotCheckLevel {
 		panic("call Debug: " + string(msg))
 	}
 }
