@@ -3,201 +3,325 @@ package logger
 import (
 	"bytes"
 	"fmt"
-	"log"
 	"os"
-	"strings"
+	"path"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"sync"
 	"time"
 )
 
 const (
-	LEVEL_ERROR int = iota
+	_LEVEL_UNKNOWN int = -1
+
+	LEVEL_FATAL int = iota
+	LEVEL_ERROR
+	LEVEL_WARNING
 	LEVEL_INFO
 	LEVEL_DEBUG
 )
 
 type ProviderInterface interface {
 	GetID() string
-	Log(msg []byte)
-	Error(msg []byte)
-	Fatal(msg []byte)
-	Debug(msg []byte)
+	Write(p []byte) (n int, err error) // io.Writer
 }
 
 type Logger struct {
-	providers      map[string]*ProviderInterface
-	logProviders   []string
-	errorProviders []string
-	fatalProviders []string
-	debugProviders []string
-	level          int
+	mu   sync.RWMutex
+	once sync.Once
+
+	level     int
+	buf       *bytes.Buffer
+	prefix    string
+	host      string
+	providers map[int][]ProviderInterface
 }
 
 func NewLogger() *Logger {
-	return &Logger{
-		providers: make(map[string]*ProviderInterface, 0),
-	}
+	return new(Logger)
 }
 
-func (l *Logger) SetLevel(level int) {
-	l.level = level
+func (l *Logger) SetLevel(val int) {
+	l.internalInit()
+
+	l.mu.Lock()
+	l.level = val
+	l.mu.Unlock()
 }
 
 func (l *Logger) RegisterProvider(p ProviderInterface) {
-	l.providers[p.GetID()] = &p
-}
+	l.internalInit()
 
-func (l *Logger) AddLogProvider(provIDs ...string) {
-	l.addProvider("log", provIDs...)
-}
+	l.mu.Lock()
+	defer l.mu.Unlock()
 
-func (l *Logger) AddErrorProvider(provIDs ...string) {
-	l.addProvider("error", provIDs...)
-}
-
-func (l *Logger) AddFatalProvider(provIDs ...string) {
-	l.addProvider("fatal", provIDs...)
-}
-
-func (l *Logger) AddDebugProvider(provIDs ...string) {
-	l.addProvider("debug", provIDs...)
-}
-
-func (l *Logger) addProvider(providerType string, providersIDs ...string) {
-
-	var IDs *[]string
-	switch providerType {
-	case "debug":
-		IDs = &l.debugProviders
-	case "log":
-		IDs = &l.logProviders
-	case "error":
-		IDs = &l.errorProviders
-	case "fatal":
-		IDs = &l.fatalProviders
-	default:
-		panic("Wrong type of the provider.")
+	list, ok := l.providers[_LEVEL_UNKNOWN]
+	if !ok {
+		list = make([]ProviderInterface, 0)
 	}
 
-	alreadyRegistred := func(id string, idsList *[]string) bool {
-		for _, val := range *idsList {
-			if val == id {
-				return true
+	var exist bool
+	for _, val := range list {
+		if val.GetID() == p.GetID() {
+			exist = true
+			break
+		}
+	}
+
+	if !exist {
+		l.providers[_LEVEL_UNKNOWN] = append(list, p)
+	}
+}
+
+func (l *Logger) AddFatalProvider(idsList ...string) {
+	for _, id := range idsList {
+		l.AddProvider(id, LEVEL_FATAL)
+	}
+}
+
+func (l *Logger) AddErrorProvider(idsList ...string) {
+	for _, id := range idsList {
+		l.AddProvider(id, LEVEL_ERROR)
+	}
+}
+
+func (l *Logger) AddWarningProvider(idsList ...string) {
+	for _, id := range idsList {
+		l.AddProvider(id, LEVEL_WARNING)
+	}
+}
+
+func (l *Logger) AddInfoProvider(idsList ...string) {
+	for _, id := range idsList {
+		l.AddProvider(id, LEVEL_INFO)
+	}
+}
+
+// OLD API (recommended use AddInfoProvider)
+func (l *Logger) AddLogProvider(idsList ...string) {
+	for _, id := range idsList {
+		l.AddProvider(id, LEVEL_INFO)
+	}
+}
+
+func (l *Logger) AddDebugProvider(idsList ...string) {
+	for _, id := range idsList {
+		l.AddProvider(id, LEVEL_DEBUG)
+	}
+}
+
+func (l *Logger) AddProvider(id string, levelList ...int) {
+	l.internalInit()
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	var provider ProviderInterface
+	for _, p := range l.providers[_LEVEL_UNKNOWN] {
+		if p.GetID() == id {
+			provider = p
+			break
+		}
+	}
+
+	if provider == nil {
+		l.Fatal("Unknown provider id:", id)
+	}
+
+	for _, level := range levelList {
+
+		list, ok := l.providers[level]
+		if !ok {
+			list = make([]ProviderInterface, 0)
+		}
+
+		var exist bool
+		for _, p := range list {
+			if p.GetID() == id {
+				exist = true
+				break
 			}
 		}
-		return false
-	}
 
-	for _, id := range providersIDs {
-
-		provider, bFound := l.providers[id]
-		if bFound {
-			pID := (*provider).GetID()
-			if !alreadyRegistred(pID, IDs) {
-				*IDs = append(*IDs, pID)
-			}
+		if !exist {
+			l.providers[level] = append(list, provider)
 		}
 	}
 }
 
-func (l *Logger) Logf(format string, params ...interface{}) {
-	if l.level < LEVEL_INFO {
-		return
-	}
+func (l *Logger) Prefix() string {
+	l.internalInit()
 
-	l.Log(fmt.Sprintf(format, params...))
+	l.mu.RLock()
+	pref := l.prefix
+	l.mu.RUnlock()
+
+	return pref
 }
 
-func (l *Logger) Log(messageParts ...interface{}) {
-	if l.level < LEVEL_INFO {
-		return
-	}
-	msg := makeMessage("LOG", messageParts)
-	for _, pID := range l.logProviders {
-		p, bFound := l.providers[pID]
-		if bFound {
-			(*p).Log(msg)
-		}
-	}
+func (l *Logger) SetPrefix(prefix string) {
+	l.internalInit()
+
+	l.mu.Lock()
+	l.prefix = prefix
+	l.mu.Unlock()
 }
 
-func (l *Logger) Errorf(format string, params ...interface{}) {
-	l.Error(fmt.Sprintf(format, params...))
-}
+var _COMPLEX_DELEMETER = []byte{':', ' '}
 
-func (l *Logger) Error(messageParts ...interface{}) {
+func (l *Logger) Output(calldepth int, level int, s string) error {
+	l.internalInit()
 
-	msg := makeMessage("ERROR", messageParts)
-	for _, pID := range l.errorProviders {
-		p, bFound := l.providers[pID]
-		if bFound {
-			(*p).Error(msg)
-		}
-	}
-}
-
-func (l *Logger) Debugf(format string, params ...interface{}) {
-	if l.level < LEVEL_DEBUG {
-		return
+	_, file, line, ok := runtime.Caller(calldepth)
+	if !ok {
+		file = "???"
+		line = 0
+	} else {
+		file = filepath.Base(file)
 	}
 
-	l.Debug(fmt.Sprintf(format, params...))
+	nowStr := time.Now().Format("2006-01-02 15:04:05.0000000 -07:00")
+	lineStr := strconv.Itoa(line)
+
+	l.mu.Lock()
+	l.buf.Reset()
+	l.buf.WriteString(levelToString(level))
+	l.buf.Write(_COMPLEX_DELEMETER)
+	l.buf.WriteString(nowStr)
+	if len(l.host) > 0 {
+		l.buf.WriteByte(' ')
+		l.buf.WriteString(l.host)
+	}
+	if len(l.prefix) > 0 {
+		l.buf.WriteByte('-')
+		l.buf.WriteString(l.prefix)
+	}
+	l.buf.WriteByte(' ')
+	l.buf.Write([]byte(file))
+	l.buf.WriteByte(':')
+	l.buf.WriteString(lineStr)
+	l.buf.Write(_COMPLEX_DELEMETER)
+	l.buf.WriteString(s)
+	l.buf.WriteByte('\n')
+
+	data := l.buf.Bytes()
+	for _, pr := range l.providers[level] {
+		pr.Write(data)
+	}
+	l.mu.Unlock()
+
+	return nil
 }
 
-func (l *Logger) Debug(messageParts ...interface{}) {
-	if l.level < LEVEL_DEBUG {
-		return
-	}
-
-	msg := makeMessage("DEBUG", messageParts)
-	for _, pID := range l.debugProviders {
-		p, bFound := l.providers[pID]
-		if bFound {
-			(*p).Debug(msg)
-		}
-	}
+func (l *Logger) Errorf(format string, v ...interface{}) {
+	l.printf(LEVEL_ERROR, format, v...)
 }
 
-func (l *Logger) Fatalf(format string, params ...interface{}) {
-	l.Fatal(fmt.Sprintf(format, params...))
+func (l *Logger) Error(v ...interface{}) {
+	l.print(LEVEL_ERROR, v...)
 }
 
-func (l *Logger) Fatal(messageParts ...interface{}) {
-	msg := makeMessage("FATAL", messageParts)
-	for _, pID := range l.fatalProviders {
-		p, bFound := l.providers[pID]
-		if bFound {
-			(*p).Fatal(msg)
-		}
-	}
+func (l *Logger) Infof(format string, v ...interface{}) {
+	l.printf(LEVEL_INFO, format, v...)
+}
 
+func (l *Logger) Info(v ...interface{}) {
+	l.print(LEVEL_INFO, v...)
+}
+
+// OLD API (recommended use Infof)
+func (l *Logger) Logf(format string, v ...interface{}) {
+	l.printf(LEVEL_INFO, format, v...)
+}
+
+// OLD API (recommended use Info)
+func (l *Logger) Log(v ...interface{}) {
+	l.print(LEVEL_INFO, v...)
+}
+
+func (l *Logger) Warningf(format string, v ...interface{}) {
+	l.printf(LEVEL_WARNING, format, v...)
+}
+
+func (l *Logger) Warning(v ...interface{}) {
+	l.print(LEVEL_WARNING, v...)
+}
+
+func (l *Logger) Debugf(format string, v ...interface{}) {
+	l.printf(LEVEL_DEBUG, format, v...)
+}
+
+func (l *Logger) Debug(v ...interface{}) {
+	l.print(LEVEL_DEBUG, v...)
+}
+
+func (l *Logger) Fatalf(format string, v ...interface{}) {
+	l.printf(LEVEL_FATAL, format, v...)
 	os.Exit(1)
 }
 
-var (
-	HOST              string
-	MESSAGE_REPLACER  = strings.NewReplacer("\r", "", "\n", "\t")
-	MESSAGE_SEPARATOR = []byte(" ")
-)
+func (l *Logger) Fatal(v ...interface{}) {
+	l.print(LEVEL_FATAL, v...)
+	os.Exit(1)
+}
 
-func makeMessage(typeLog string, err []interface{}) []byte {
-
-	if len(HOST) == 0 {
-		HOST, _ = os.Hostname()
+func (l *Logger) print(level int, v ...interface{}) {
+	if l.isValidLogLevel(level) {
+		l.Output(3, level, fmt.Sprintln(v...))
 	}
+}
 
-	buf := bytes.NewBuffer(nil)
-	prefix := fmt.Sprintf("%s: %s %s ", typeLog, time.Now().Format(time.RFC3339), HOST)
-	logger := log.New(buf, prefix, log.Lshortfile)
+func (l *Logger) printf(level int, format string, v ...interface{}) {
+	if l.isValidLogLevel(level) {
+		l.Output(3, level, fmt.Sprintf(format, v...))
+	}
+}
 
-	msg := bytes.NewBuffer(nil)
-	for i, v := range err {
-		if i > 0 {
-			msg.Write(MESSAGE_SEPARATOR)
+func (l *Logger) isValidLogLevel(level int) bool {
+	l.internalInit()
+
+	l.mu.RLock()
+	lvl := l.level
+	l.mu.RUnlock()
+
+	return level <= lvl
+}
+
+func (l *Logger) internalInit() {
+	l.once.Do(func() {
+		l.buf = bytes.NewBuffer(make([]byte, 0, 4096))
+		if len(l.prefix) == 0 {
+			l.prefix = path.Base(os.Args[0])
 		}
-		fmt.Fprint(msg, v)
+
+		if val, err := os.Hostname(); err == nil {
+			l.host = val
+		}
+
+		if l.providers == nil {
+			l.providers = make(map[int][]ProviderInterface)
+		}
+
+		if l.level == 0 {
+			l.level = LEVEL_DEBUG
+		}
+	})
+}
+
+func levelToString(l int) string {
+	switch l {
+	case LEVEL_FATAL:
+		return "FTL"
+	case LEVEL_ERROR:
+		return "ERR"
+	case LEVEL_WARNING:
+		return "WRN"
+	case LEVEL_INFO:
+		return "INF"
+	case LEVEL_DEBUG:
+		return "DBG"
+	default:
+		return fmt.Sprintf("Level(%d)", l)
 	}
-
-	logger.Output(3, MESSAGE_REPLACER.Replace(msg.String()))
-
-	return bytes.Replace(buf.Bytes(), []byte("\n"), []byte{}, -1)
 }
